@@ -1,0 +1,8 @@
+name: tool-events-broadcaster
+version: 1.0.0
+description: "Broadcast tool execution events to JARVIS Dashboard for visual rendering"
+author: "Hermes Agent"
+hooks:
+  - pre_tool_call
+  - post_tool_call
+  - post_llm_call
