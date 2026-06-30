@@ -1,9 +1,11 @@
 """tool-events-broadcaster plugin — create tool windows via JARVIS API.
 
-Listens to pre_tool_call and post_tool_call hooks.
-On tool.start: creates a new tool-window-single instance via JARVIS API
-On tool.complete: pushes update data to the instance
-On post_llm_call: kills all tool windows created in this turn
+Lifecycle:
+- pre_tool_call: spawn tool-window-single (FIFO eviction for non-todo, todo gets fixed slot)
+                 At turn start, kill leftover todo panels from previous turn.
+- post_tool_call: push update data (completion status, output)
+- post_llm_call: mark turn boundary (no cleanup)
+- on_session_end / on_session_reset: kill ALL tool windows for the session
 """
 
 from __future__ import annotations
@@ -24,8 +26,15 @@ JARVIS_URL = os.getenv("JARVIS_DASHBOARD_URL", "http://localhost:9090")
 _session_instances: Dict[str, List[dict]] = {}
 # Active tools: tool_id -> {instance_id, session_id}
 _active_tools: Dict[str, dict] = {}
-# Track which sessions had tools in current turn
+# Track which sessions have active tool calls in current turn
 _sessions_with_tools: set = set()
+# Cascade offset counter per session (for tiling tool windows)
+_cascade_counters: Dict[str, int] = {}
+# Cascade step (pixels) — windows are offset by this amount each spawn
+_CASCADE_STEP_X = 40
+_CASCADE_STEP_Y = 30
+# Max concurrent tool windows per session
+_MAX_WINDOWS = 4
 _lock = threading.Lock()
 
 
@@ -58,7 +67,7 @@ def _read_file_content(path: str) -> str:
     return ""
 
 
-def _spawn_tool_window(tool_id: str, name: str, context: str, args: dict) -> str | None:
+def _spawn_tool_window(tool_id: str, name: str, context: str, args: dict, position: dict | None = None) -> str | None:
     """Create a new tool-window-single instance."""
     config = {
         "tool_id": tool_id,
@@ -71,10 +80,15 @@ def _spawn_tool_window(tool_id: str, name: str, context: str, args: dict) -> str
     if name == "write_file" and args.get("path"):
         config["old_content"] = _read_file_content(args["path"])
     
-    result = _api_call("POST", "/api/plugins/spawn", {
+    payload = {
         "plugin_id": "tool-window-single",
+        "title": name,
         "config": config
-    })
+    }
+    if position:
+        payload["position"] = position
+    
+    result = _api_call("POST", "/api/plugins/spawn", payload)
     if result.get("ok"):
         return result["instance"]["instance_id"]
     return None
@@ -94,9 +108,11 @@ def _push_update(instance_id: str, data: dict):
 
 
 def _cleanup_session(session_id: str):
-    """Kill all tool windows created in this session."""
+    """Kill all tool windows for a session."""
     with _lock:
         instances = _session_instances.pop(session_id, [])
+        _cascade_counters.pop(session_id, None)
+        _sessions_with_tools.discard(session_id)
     
     if not instances:
         return
@@ -105,6 +121,22 @@ def _cleanup_session(session_id: str):
         iid = inst.get("instance_id")
         if iid:
             _kill_instance(iid)
+
+
+def _evict_stale_todos(session_id: str):
+    """Kill leftover todo panels from a previous turn (called at turn start)."""
+    with _lock:
+        instances = _session_instances.get(session_id, [])
+        stale_todos = [inst for inst in instances if inst.get("tool_name") == "todo"]
+        if not stale_todos:
+            return
+        # Remove from tracking list
+        _session_instances[session_id] = [inst for inst in instances if inst.get("tool_name") != "todo"]
+    
+    for inst in stale_todos:
+        iid = inst.get("instance_id")
+        if iid:
+            threading.Thread(target=_kill_instance, args=(iid,), daemon=True).start()
 
 
 def _extract_context(tool_name: str, args: dict) -> str:
@@ -164,10 +196,43 @@ def register(ctx) -> None:
             context = _extract_context(tool_name, args or {})
             
             with _lock:
+                # If this is the first tool call of a new turn, evict stale todos
+                is_new_turn = sid not in _sessions_with_tools
                 _sessions_with_tools.add(sid)
             
+            if is_new_turn:
+                _evict_stale_todos(sid)
+            
+            with _lock:
+                # Evict oldest non-todo window if at capacity (todo panels survive the turn)
+                instances = _session_instances.get(sid, [])
+                if len(instances) >= _MAX_WINDOWS:
+                    victim = None
+                    for i, inst in enumerate(instances):
+                        if inst.get("tool_name") != "todo":
+                            victim = instances.pop(i)
+                            break
+                    if victim:
+                        threading.Thread(target=_kill_instance, args=(victim["instance_id"],), daemon=True).start()
+                # Calculate cascade position: todo gets fixed last slot, others cycle 0..MAX-2
+                is_todo = (tool_name == "todo")
+                if is_todo:
+                    idx = _MAX_WINDOWS - 1  # fixed rightmost slot
+                else:
+                    idx = _cascade_counters.get(sid, 0)
+                    _cascade_counters[sid] = (idx + 1) % (_MAX_WINDOWS - 1)  # cycle 0..2
+                base_x = 20 + idx * _CASCADE_STEP_X
+                base_y = 20 + idx * _CASCADE_STEP_Y
+                position = {
+                    "mode": "floating",
+                    "x": base_x,
+                    "y": base_y,
+                    "width": 450,
+                    "height": 500
+                }
+            
             def do_spawn():
-                instance_id = _spawn_tool_window(tid, tool_name, context, args or {})
+                instance_id = _spawn_tool_window(tid, tool_name, context, args or {}, position)
                 if instance_id:
                     with _lock:
                         _active_tools[tid] = {
@@ -225,18 +290,23 @@ def register(ctx) -> None:
             print(f"[tool-events] post_tool_call error: {e}", file=sys.stderr)
     
     def on_post_llm_call(session_id="", **kwargs):
-        """Clean up all tool windows when turn ends (LLM call completes)."""
+        """Mark turn boundary — no cleanup here, panels persist across turns."""
         sid = session_id or "default"
-        
         with _lock:
-            had_tools = sid in _sessions_with_tools
             _sessions_with_tools.discard(sid)
-        
-        if not had_tools:
-            return
-        
+    
+    def on_session_end(session_id="", **kwargs):
+        """Clean up ALL tool windows when session ends."""
+        sid = session_id or "default"
+        threading.Thread(target=_cleanup_session, args=(sid,), daemon=True).start()
+    
+    def on_session_reset(session_id="", **kwargs):
+        """Clean up ALL tool windows when session resets (/new, /clear, /reset)."""
+        sid = session_id or "default"
         threading.Thread(target=_cleanup_session, args=(sid,), daemon=True).start()
     
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
+    ctx.register_hook("on_session_end", on_session_end)
+    ctx.register_hook("on_session_reset", on_session_reset)
